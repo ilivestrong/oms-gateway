@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 
 const (
 	envFile = ".env"
+	version = "v1.0.0"
 )
 
 var (
@@ -35,6 +37,8 @@ var (
 )
 
 func main() {
+	appLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	err := loadEnv(envFile)
 	if err != nil {
 		log.Fatal("failed to load .env")
@@ -62,10 +66,11 @@ func main() {
 		ProductServiceListenAddress: productSvcAddress,
 	}
 
-	runGatewayServer(ctx, options)
+	appLogger.Info("oms-gatway", "version", version)
+	runGatewayServer(ctx, options, appLogger)
 }
 
-func runGatewayServer(ctx context.Context, opts *internal.Options) {
+func runGatewayServer(ctx context.Context, opts *internal.Options, logger *slog.Logger) {
 	svc, err := internal.New(opts)
 	if err != nil {
 		log.Fatal("gateway service failed to start.")
@@ -73,14 +78,15 @@ func runGatewayServer(ctx context.Context, opts *internal.Options) {
 
 	orderSvcClient := omspb.NewOrderServiceClient(svc.OrderSvcClientConn)
 	productSvcClient := omspb.NewProductServiceClient(svc.ProductSvcClientConn)
+
 	gatewaySvc := gatewayservice.New(productSvcClient, orderSvcClient)
 
 	mux := runtime.NewServeMux()
 	muxWithMiddlewares := bindMiddlewaresToMux(mux, middlewares.Authorize, middlewares.RateLimitMiddleware(10, time.Second))
-	muxWithMiddlewares.HandleFunc("/login", authHandler)
+	muxWithMiddlewares.HandleFunc("/login", authHandler(logger))
 
 	if err := omspb.RegisterGatewayServiceHandlerServer(ctx, mux, gatewaySvc); err != nil {
-		log.Println("faild to register", err)
+		log.Fatalf("faild to register: %v", err)
 	}
 
 	go func() {
@@ -88,7 +94,7 @@ func runGatewayServer(ctx context.Context, opts *internal.Options) {
 			log.Fatalf("Failed to start server:: http.ListenAndServe(): %v", err)
 		}
 	}()
-	log.Println("server listening at:", opts.ListenAddressHTTPPort)
+	logger.Info("server listening at:", "port", opts.ListenAddressHTTPPort)
 
 	shutdownOnSignal(svc)
 }
@@ -99,27 +105,31 @@ func bindMiddlewaresToMux(mux *runtime.ServeMux, mws ...alice.Constructor) *http
 	return muxWithMiddlewares
 }
 
-func authHandler(w http.ResponseWriter, r *http.Request) {
-	tokenRequest, err := getTokenRequest(r)
-	if err != nil {
-		sendResponse(w, []byte(err.Error()), "", http.StatusBadRequest)
-		return
-	}
+func authHandler(logger *slog.Logger) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tokenRequest, err := getTokenRequest(r)
+		if err != nil {
+			sendResponse(w, []byte(err.Error()), "", http.StatusBadRequest)
+			return
+		}
 
-	if strings.Trim(tokenRequest.Email, " ") == "" {
-		sendResponse(w, []byte(ErrInvalidTokenRequest), "", http.StatusBadRequest)
-		return
-	}
+		if strings.Trim(tokenRequest.Email, " ") == "" {
+			sendResponse(w, []byte(ErrInvalidTokenRequest), "", http.StatusBadRequest)
+			return
+		}
 
-	token, err := auth.GenerateAccessToken(*tokenRequest)
-	if err != nil {
-		log.Fatal(err)
+		token, err := auth.GenerateAccessToken(*tokenRequest)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tokenBytes, err := json.Marshal(token)
+		if err != nil {
+			logger.Error("authHandler:", "err", fmt.Sprintf("failed to create token: %v", err))
+			sendResponse(w, []byte("failed to create token"), "", http.StatusInternalServerError)
+			return
+		}
+		sendResponse(w, tokenBytes, EncodingTypeJSON, http.StatusOK)
 	}
-	tokenBytes, err := json.Marshal(token)
-	if err != nil {
-		log.Fatal(errors.New("failed to create token"))
-	}
-	sendResponse(w, tokenBytes, EncodingTypeJSON, http.StatusOK)
 }
 
 func getTokenRequest(req *http.Request) (*auth.TokenRequest, error) {
